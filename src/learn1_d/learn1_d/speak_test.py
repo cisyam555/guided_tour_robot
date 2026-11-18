@@ -11,12 +11,16 @@ import argparse
 import time
 
 import rclpy
-from interaction_msgs.srv import TtsService
+from interaction_msgs.srv import InstructionService, TtsService
 from rclpy.node import Node
 
 TTS_SERVICE = "/intelligent_interaction/tts/play"
+VOICE_SERVICE = "/intelligent_interaction/tts/update_voice_id"
 PLAYING_STATUS = "playing"
 SETTLE_S = 0.4
+# 本项目的专属音色：播报前切女声，播完恢复平台默认男声，避免影响别的项目
+VOICE_ID = "tiangong_v4"
+VOICE_DEFAULT = "tiangong_v2"
 
 # 不传命令行文本时，默认播这句；改这里就能改默认话术。
 DEFAULT_TEXT = "你好，我是导览机器人，现在开始参观"
@@ -31,6 +35,32 @@ class Speaker(Node):
         self.interrupt = interrupt
         self.service = service
         self.cli = self.create_client(TtsService, service)
+        self.voice_id = VOICE_ID
+        self.voice_default = VOICE_DEFAULT
+        self._voice_cli = None
+
+    def set_voice(self, voice: str) -> None:
+        """切换全局音色；失败只告警，不打断播报。"""
+        if not voice:
+            return
+        if self._voice_cli is None:
+            self._voice_cli = self.create_client(InstructionService, VOICE_SERVICE)
+        if not self._voice_cli.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn("音色服务未就绪，沿用当前音色")
+            return
+        req = InstructionService.Request()
+        req.cmd = voice
+        future = self._voice_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        if not future.done():
+            self.get_logger().warn(f"切换音色 {voice} 超时")
+            future.cancel()
+            return
+        try:
+            if not future.result().success:
+                self.get_logger().warn(f"切换音色 {voice} 被拒绝")
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"切换音色 {voice} 异常：{exc}")
 
     def call(self, cmd: str, text: str = "", msg_type: str = "",
              audio_id: str = ""):
@@ -65,6 +95,13 @@ class Speaker(Node):
             self.get_logger().error(f"TTS 服务未就绪：{self.service}")
             return False
 
+        self.set_voice(self.voice_id)
+        try:
+            return self._speak_once()
+        finally:
+            self.set_voice(self.voice_default)
+
+    def _speak_once(self) -> bool:
         if self.interrupt:
             self.get_logger().info("先打断当前播报")
             self.stop()
