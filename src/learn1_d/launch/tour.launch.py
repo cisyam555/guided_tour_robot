@@ -48,6 +48,8 @@ def _arguments(context):
         argv += ["--reloc-poi", cfg["reloc_poi"]]
     if _flag(cfg["reloc"]):
         argv.append("--reloc")
+    if _flag(cfg["localization_only"]):
+        argv.append("--localization-only")
     if _flag(cfg["plan"]):
         argv.append("--plan")
     if not _flag(cfg["guard"]):
@@ -93,8 +95,10 @@ def generate_launch_description():
                              description="自定义路线时依次访问的点位，逗号分隔"),
         DeclareLaunchArgument("return_poi", default_value="",
                              description="自定义路线时返回的点位，留空不返回"),
-        DeclareLaunchArgument("reloc_poi", default_value="POI_01",
-                             description="重定位用的点位名；清空则用 --start / 当前地图"),
+        DeclareLaunchArgument("reloc_poi", default_value="",
+                             description="车实际所在的已知点位；留空保留底盘定位，不猜起点"),
+        DeclareLaunchArgument("localization_only", default_value="false",
+                             description="只检查/恢复定位后退出，不导航、不播报"),
         DeclareLaunchArgument("reloc", default_value="false",
                              description="true=强制重新匹配定位"),
         DeclareLaunchArgument("plan", default_value="false",

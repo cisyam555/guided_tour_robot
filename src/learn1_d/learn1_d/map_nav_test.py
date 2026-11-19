@@ -27,7 +27,7 @@
        已经是当前地图时不会重复加载，避免打断定位。
     3. 定位状态 1/2/3/5（1=丢失 2=降级 3=异常 5=等待重定位）时自动下发一次
        recover_localization。初始位姿优先级：
-         --pose x,y,yaw  >  --reloc-poi 点位坐标  >  --start 点位坐标
+         --pose x,y,yaw  >  显式 --reloc-poi 点位坐标（不再默认用 --start）
        所以车停在某已知点位旁边时，直接 --reloc-poi POI_01 即可，不用抄坐标。
     4. 点位坐标和朝向全部来自底盘，本地不维护。
     5. --track 指定轨道名时，每段用 move_to_locations_poi 沿轨道走；
@@ -99,6 +99,7 @@ from learn1_d.nav_core import (  # noqa: E402
     SafetyStop,
     align_to_yaw,
     check_route,
+    check_map,
     current_map,
     goto_poi,
     load_map,
@@ -144,9 +145,27 @@ def parse_pose(text):
 
 
 def announce(args, text):
-    """按 --no-speak 开关播报；播报失败不影响流程。"""
-    if args.speak and text:
+    """按 --no-speak 开关播报；播报期间静音麦克风，播完恢复，避免自听。"""
+    if not (args.speak and text):
+        return
+    muted = False
+    try:
+        from learn1_d.voice_wait import set_muted
+
+        set_muted(True)
+        muted = True
+    except Exception:  # noqa: BLE001 - 语音模块不可用时只影响静音，不影响播报
+        pass
+    try:
         speak_text(text)
+    finally:
+        if muted:
+            try:
+                from learn1_d.voice_wait import set_muted
+
+                set_muted(False)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def run_step(label, func):
@@ -230,12 +249,25 @@ def wait_for_visitor(args, guard, waiter, voice, words, sway=None):
 
 def run_tour(args, chassis, guard, pois, targets, track_id, poi_scripts,
              on_blocked, on_resume, on_blocked_return, on_resume_return,
-             need_move_to_start, qa=None):
+             qa=None):
     """走一整趟导览。返回 0=走完，1=回程失败；安全类异常继续上抛交给 main。"""
-    # 起点较远时先自己走过去，再播欢迎语、摆正车头、开始导览。
-    if need_move_to_start:
-        goto_poi(chassis, args.start, pois[args.start], args.timeout, None,
-                 guard, on_blocked, on_resume, args.turn_w)
+    # 每次启动导览前实时判断与起点的距离，避免待机期间被挪动后按旧距离判断。
+    if args.route != "custom" and args.start:
+        pose_now = chassis.get_pose() or {}
+        start = pois[args.start]
+        try:
+            offset = math.hypot(float(pose_now["x"]) - float(start["x"]),
+                                float(pose_now["y"]) - float(start["y"]))
+        except (KeyError, TypeError, ValueError):
+            raise RuntimeError("无法读取当前位姿，拒绝导航")
+        if not math.isfinite(offset):
+            raise RuntimeError("当前位姿非有限数值，拒绝导航")
+        if offset > 0.5:
+            print(f"当前距起点 {args.start} 约 {offset:.1f} m，先自动导航到起点")
+            goto_poi(chassis, args.start, pois[args.start], args.timeout, None,
+                     guard, on_blocked, on_resume, args.turn_w)
+        else:
+            print(f"当前距起点 {args.start} 约 {offset:.1f} m，直接在起点开始")
 
     # 出发前播报欢迎语，再摆正车头、依次出发。
     announce(args, args.greet)
@@ -384,6 +416,8 @@ def main():
                         help="问候后等待语音指令的秒数；0 表示用配置里的值")
     parser.add_argument("--sway-deg", type=float, default=0.0,
                         help="待机时上半身左右摇摆的角度（度）；0 表示不摇晃（默认）")
+    parser.add_argument("--localization-only", action="store_true",
+                        help="只加载/检查定位，完成后退出，不导航、不播报")
     parser.add_argument("--pose", default="", help="重定位初始位姿 x,y,yaw")
     parser.add_argument("--reloc-poi", default="",
                         help="重定位用哪个点位的坐标（车停在该点位附近时填它）")
@@ -414,6 +448,8 @@ def main():
     if "--ros-args" in argv:
         argv = argv[:argv.index("--ros-args")]
     args = parser.parse_args(argv)
+    if args.localization_only:
+        args.speak = False
     try:
         tour = load_tour(args.config or None)
         apply_route(args, tour)
@@ -449,8 +485,8 @@ def main():
     pose = parse_pose(args.pose)
     if pose is not None and not all(math.isfinite(v) for v in pose):
         parser.error("--pose 坐标必须是有限数值")
-    # 没给 --pose 时，用点位坐标做重定位初始位姿；未指定 --reloc-poi 时用 --start。
-    reloc_poi = args.reloc_poi or args.start
+    # 只有用户明确声明的位置可作初值；路线起点不等于当前位置。
+    reloc_poi = args.reloc_poi
     chassis = KnewbotChassisNav(host=args.host, rest_port=args.port)
     guard = None
     qa = None
@@ -463,14 +499,15 @@ def main():
                 print("提示：用 --pois 指定按顺序访问的点位才开始导览")
             return 0
 
-        # 所有导航命令先核对地图、点位和轨道，避免参数错时已经切图/重定位。
+        # 所有导航命令先核对目标地图本身、点位和轨道，避免参数错时已经切图/重定位。
+        check_map(chassis, args.map or None)
         pois, track_id = check_route(chassis, args, targets)
         if args.plan:
             print("路线检查通过；未加载地图、重定位、播报或下发运动")
             return 0
 
         if args.map:
-            _, pose = load_map(chassis, args.map, timeout_s=60.0,
+            _, pose = load_map(chassis, args.map, timeout_s=90.0,
                                pose=pose, reloc_poi=reloc_poi)
         elif pose is None and reloc_poi:
             pose = poi_pose_from_map(chassis, reloc_poi)
@@ -482,6 +519,10 @@ def main():
             raise RuntimeError(
                 "定位未就绪，拒绝导航（可用 --reloc-poi 点位名或 --pose x,y,yaw）")
 
+        if args.localization_only:
+            print("定位检查通过；未启动导航、播报、待机或底盘运动")
+            return 0
+
         health = chassis.get_robot_health()
         print(f"底盘健康：{health}")
         if health.hasFatal or health.hasError:
@@ -492,26 +533,12 @@ def main():
                 raise RuntimeError("底盘报告故障，拒绝导航；请先处理维护模式、定位或其他故障")
 
         if args.map and current_map(chassis)[1] != map_short_name(args.map):
-            raise RuntimeError("当前地图与计划不符，拒绝导航")
+            raise RuntimeError(
+                f"地图切换失败：当前 {current_map(chassis)[1]}，"
+                f"计划 {map_short_name(args.map)}，拒绝导航")
 
         # 地图确认后重新读取点位/轨道，避免沿用加载前的旧数据。
         pois, track_id = check_route(chassis, args, targets, verbose=False)
-
-        # 不在起点时不再直接退出：先自动点对点导航到起点，再开始导览。
-        need_move_to_start = False
-        if args.route != "custom":
-            pose_now = chassis.get_pose() or {}
-            start = pois[args.start]
-            try:
-                offset = math.hypot(float(pose_now["x"]) - float(start["x"]),
-                                    float(pose_now["y"]) - float(start["y"]))
-            except (KeyError, TypeError, ValueError):
-                raise RuntimeError("无法读取当前位姿，拒绝导航")
-            if not math.isfinite(offset):
-                raise RuntimeError("当前位姿非有限数值，拒绝导航")
-            need_move_to_start = offset > 0.5
-            if need_move_to_start:
-                print(f"当前距起点 {args.start} 约 {offset:.1f} m，先自动导航到起点")
 
         chassis.set_aeb_control("On")
         chassis.set_speed_params(max_moving_speed=args.speed)
@@ -581,11 +608,15 @@ def main():
             try:
                 from learn1_d.voice_wait import VoiceWaiter
 
-                waiter = VoiceWaiter()
+                waiter = VoiceWaiter(hotwords=",".join(words))
             except Exception as exc:  # noqa: BLE001 - 语音不可用就别贸然出发
                 print(f"语音待机不可用：{exc}")
                 announce(args, "语音功能没有准备好，请联系工作人员")
                 return 1
+            # 让音频流开关的服务调用完成，再进入问候/待机。
+            waiter.spin_for(1.5)
+            if qa is not None:
+                qa.set_waiter(waiter)
             # 待机时上身轻微摇晃；有人靠近时先回正，再问候。
             sway = None
             if args.sway_deg > 0:
@@ -614,7 +645,7 @@ def main():
                     result = run_tour(args, chassis, guard, pois, targets, track_id,
                                       poi_scripts, on_blocked, on_resume,
                                       on_blocked_return, on_resume_return,
-                                      need_move_to_start, qa)
+                                      qa)
                     if result != 0:
                         return result
                     # 走完不退出：说一句结束语，然后回到待机等下一位游客。
@@ -628,7 +659,7 @@ def main():
             return run_tour(args, chassis, guard, pois, targets, track_id,
                             poi_scripts, on_blocked, on_resume,
                             on_blocked_return, on_resume_return,
-                            need_move_to_start, qa)
+                            qa)
 
     except KeyboardInterrupt:
         # Ctrl+C：不播报，直接安静退出（入口是 console_scripts，这里必须自己接）。

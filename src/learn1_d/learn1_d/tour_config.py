@@ -17,7 +17,7 @@ ALIGN_TOLERANCE_RAD = 0.10
 ALIGN_MAX_ATTEMPTS = 3
 # 停车后定位姿态会延迟刷新，最多等这么久让它追上目标，再决定要不要补转
 ALIGN_SETTLE_S = 4.0
-# 重定位下发返回 5001 时任务可能已受理，继续轮询并隔一段时间重试
+# 仅在上次重定位任务明确失败后允许有限重试；已受理或状态不明时不补发
 RECOVER_MAX_ATTEMPTS = 3
 RECOVER_RETRY_S = 10.0
 # 底盘在停稳/换任务的过渡期会瞬间拒绝新任务：failed 且距离、耗时都是 0。

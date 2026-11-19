@@ -32,6 +32,16 @@ from learn1_d.tour_config import (
     TERMINAL_FAIL,
 )
 
+# 底盘在终点前被近物挡住时的判定：剩余距离不超过 2 m，
+# 且深度相机看到 0.8 m 内有东西，就按“被挡住”处理而不是当作失败。
+NEAR_GOAL_MM = 2000.0
+NEAR_GOAL_OBSTACLE_M = 0.8
+# 剩余距离变化小于 15 cm 视为没在前进，用来识别终点前的原地微调。
+NO_PROGRESS_DIST_MM = 150.0
+# 与点位偏差小于这个值时不再下发导航：底盘对极近目标会直接回 failed，
+# 日志里表现为 distance_remaining=0、distance_time=0，动作根本没起步。
+GOAL_ARRIVE_M = 0.4
+
 # ---------------------------------------------------------------- 动作执行与等待
 
 
@@ -80,9 +90,18 @@ class SafetyStop(RuntimeError):
 
 
 def never_started(status):
-    """动作被判 failed 且从未起步（距离与耗时都为 0）时返回 True。"""
+    """动作被判 failed 且从未起步时返回 True。
+
+    底盘拒绝任务时常见 distance_time=0，但 distance_remaining 仍是整段距离，
+    所以不能要求两者都为 0；只要没有预计耗时，就按“没有起步”处理，允许重发。
+    """
     if not isinstance(status, dict):
         return False
+    if "distance_time" in status:
+        try:
+            return float(status["distance_time"]) == 0.0
+        except (TypeError, ValueError):
+            return False
     seen = False
     for key in ("distance_time", "distance_remaining"):
         if key not in status:
@@ -107,7 +126,8 @@ def wait_action(chassis, label, action_id, timeout_s, guard=None):
         next_status = 0.0
         next_stale_log = 0.0
         stale_since = None
-        progress_sig = None
+        progress_time = None
+        progress_remaining = None
         progress_since = time.monotonic()
         while time.monotonic() < deadline:
             now = time.monotonic()
@@ -145,11 +165,22 @@ def wait_action(chassis, label, action_id, timeout_s, guard=None):
                     return
                 if verdict == "failure":
                     raise ActionFailed(f"{label} 失败或结果不明确：{status}", status)
-                # 导航任务被受理却完全不动：剩余距离/预计时间一直不变，说明底盘没起步
+                # 导航任务被受理却完全不动：剩余距离/预计时间一直不变，说明底盘没起步。
+                # 终点前被挡住时剩余距离会在几厘米内来回跳，不能只看是否完全相等。
                 if status.get("type") == "move_to":
-                    sig = (status.get("distance_time"), status.get("distance_remaining"))
-                    if sig != progress_sig:
-                        progress_sig = sig
+                    cur_time = status.get("distance_time")
+                    try:
+                        cur_remaining = float(status.get("distance_remaining"))
+                    except (TypeError, ValueError):
+                        cur_remaining = None
+                    improved = progress_time is None or cur_time != progress_time
+                    if (not improved and cur_remaining is not None
+                            and progress_remaining is not None
+                            and abs(cur_remaining - progress_remaining) > NO_PROGRESS_DIST_MM):
+                        improved = True
+                    if improved:
+                        progress_time = cur_time
+                        progress_remaining = cur_remaining
                         progress_since = now
                     elif now - progress_since >= NO_PROGRESS_S:
                         raise ActionFailed(
@@ -226,6 +257,24 @@ def print_pois(chassis, map_name=None):
     for name, poi in sorted(pois.items()):
         print(f"  {name:<10} x={poi.get('x')}  y={poi.get('y')}  yaw={poi.get('yaw')}")
     return pois
+
+
+def check_map(chassis, map_name):
+    """启动前只读校验目标地图：必须存在且有点位，避免切图后才发现配置写错。"""
+    cur_full, cur_short = current_map(chassis)
+    print(f"底盘当前地图：{cur_short or '未知'}（{cur_full or '无'}）")
+    if not map_name:
+        print("未指定目标地图，沿用当前地图")
+        return
+    target = map_short_name(map_name)
+    _, pois = read_pois(chassis, map_name=map_name)
+    if not pois:
+        raise ValueError(
+            f"地图 {target} 不存在或没有点位，拒绝启动；"
+            "请先在底盘建图并录制点位后重试")
+    print(f"目标地图：{target}，点位 {len(pois)} 个，校验通过")
+    if cur_short and cur_short != target:
+        print(f"当前地图 {cur_short} 与目标 {target} 不一致，启动后将自动切换到 {target}")
 
 
 def read_tracks(chassis, map_name=None):
@@ -314,38 +363,109 @@ def check_route(chassis, args, targets, verbose=True):
 # ---------------------------------------------------------------- 地图加载与定位
 
 
-def wait_localization(chassis, timeout_s, pose):
-    """等定位就绪；卡在等待重定位时用 pose 主动重定位，失败会重试。
+def _accepted_recovery(exc):
+    """SDK 的异常文本只有前 200 字；从 HTTP cause 中读取完整任务编号。"""
+    response = getattr(getattr(exc, "cause", None), "response", None)
+    if response is None:
+        return None
+    try:
+        result = response.json()
+    except (ValueError, TypeError):
+        return None
+    if isinstance(result, dict) and result.get("accepted") is True:
+        return action_id_from(result)
+    return None
 
-    底盘偶发返回 5001 Internal error，但响应里 accepted=true 且带 action_id，
-    说明任务可能已受理；这里不直接退出，继续轮询状态，隔一段时间再补发。
+
+def wait_localization(chassis, timeout_s, pose, force=False):
+    """正常定位连续确认；有已知初值时提交重定位，并跟踪单个任务。
+
+    不根据起点猜当前位置，不重载当前地图；仅明确失败的任务允许有限重试。
+    HTTP 异常中已受理的任务沿用完整 action_id，结果不明时绝不补发。
     """
     deadline = time.monotonic() + timeout_s
     attempts = 0
     next_recover = 0.0
     last = None
-    while time.monotonic() < deadline:
-        rv = chassis.get_localization_status() or {}
-        status = rv.get("slam_status")
-        if status != last:
-            print(f"  定位状态：slam_status={status}（0=正常 5=等待重定位）")
-            last = status
-        if status == 0:
-            return True
-        now = time.monotonic()
-        if (status in RELOCALIZE_TRIGGER and pose is not None
-                and attempts < RECOVER_MAX_ATTEMPTS and now >= next_recover):
-            x, y, yaw = pose
-            print(f"  下发重定位（第 {attempts + 1} 次）：x={x}, y={y}, yaw={yaw}")
+    stable = 0
+    active = None
+    recovered = False
+    needs_recovery = force
+    if pose is not None:
+        pose = tuple(float(v) for v in pose)
+        if len(pose) != 3 or not all(math.isfinite(v) for v in pose):
+            raise ValueError("重定位初始位姿必须是有限数值 x,y,yaw")
+    if force and pose is None:
+        raise ValueError("强制重定位需要明确的 --pose 或 --reloc-poi")
+    try:
+        while time.monotonic() < deadline:
+            rv = chassis.get_localization_status() or {}
+            status = rv.get("slam_status")
+            if status != last:
+                print(f"  定位状态：slam_status={status} "
+                      "（0=正常 5=等待重定位 6=定位中 7=加载地图 8=等待传感器）")
+                last = status
+            if active is not None:
+                result = chassis.get_action_status(active)
+                verdict = classify_action(result)
+                if verdict == "failure":
+                    print(f"  重定位任务 {active} 明确失败：{result}")
+                    active = None
+                    stable = 0
+                    needs_recovery = True
+                    if attempts >= RECOVER_MAX_ATTEMPTS:
+                        return False
+                    next_recover = time.monotonic() + RECOVER_RETRY_S
+                elif verdict == "success":
+                    print(f"  重定位任务 {active} 已完成，等待定位状态稳定")
+                    active = None
+                    recovered = True
+                    needs_recovery = False
+                else:
+                    stable = 0
+                    time.sleep(POLL_S)
+                    continue
+            # 即使 SLAM 暂时报 0，也不能绕过仍在执行/已经失败的重定位任务。
+            if status == 0 and not needs_recovery:
+                stable += 1
+                if stable >= 3:
+                    return True
+            else:
+                stable = 0
+            now = time.monotonic()
+            if (not recovered and pose is not None and now >= next_recover
+                    and attempts < RECOVER_MAX_ATTEMPTS
+                    and (status in RELOCALIZE_TRIGGER or (force and status == 0))):
+                x, y, yaw = pose
+                attempts += 1
+                needs_recovery = True
+                print(f"  下发重定位（第 {attempts} 次）：x={x}, y={y}, yaw={yaw}")
+                try:
+                    response = chassis.recover_localization(
+                        x=x, y=y, yaw=yaw,
+                        max_time_ms=max(1, int((deadline - now) * 1000)))
+                except Exception as exc:
+                    active = _accepted_recovery(exc)
+                    if active is None:
+                        raise RuntimeError(
+                            f"重定位提交失败或受理状态不明，停止自动重试：{exc}") from exc
+                    print(f"  接口报错但任务已受理，跟踪 action_id={active}，不重复提交")
+                else:
+                    active = action_id_from(response)
+                print(f"  重定位任务编号：{active}")
+            time.sleep(POLL_S)
+        print("定位等待超时；未开始导航。请检查底盘定位服务、激光数据和地图匹配。")
+        if pose is None:
+            print("未提供已知当前位置；请在厂家界面定位，或将车放在已知点位，"
+                  "用 reloc_poi:=点位名 指定。SDK 未提供明确的全局重定位接口。")
+        return False
+    finally:
+        if active is not None:
             try:
-                chassis.recover_localization(x=x, y=y, yaw=yaw)
-            except Exception as exc:  # noqa: BLE001 - 底盘 5001 不代表没提交
-                print(f"  重定位接口返回异常：{exc}")
-                print("  先继续等待定位状态，必要时再补发")
-            attempts += 1
-            next_recover = now + RECOVER_RETRY_S
-        time.sleep(POLL_S)
-    return False
+                chassis.cancel_action([active])
+                print(f"已请求取消本次重定位任务 {active}；未取消其他任务")
+            except Exception as exc:
+                print(f"取消重定位失败，请在底盘界面检查任务：{exc}")
 
 
 def relocalize(chassis, pose, timeout_s=60.0):
@@ -363,16 +483,8 @@ def relocalize(chassis, pose, timeout_s=60.0):
         bx, by = float(before["x"]), float(before["y"])
     except (KeyError, TypeError, ValueError):
         bx = by = None
-    chassis.recover_localization(x=x, y=y, yaw=yaw)
-
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        rv = chassis.get_localization_status() or {}
-        if rv.get("slam_status") == 0:
-            break
-        time.sleep(POLL_S)
-    else:
-        raise RuntimeError(f"强制重定位超时（{timeout_s:.0f}s 内定位未就绪）")
+    if not wait_localization(chassis, timeout_s, pose, force=True):
+        raise RuntimeError(f"强制重定位失败（{timeout_s:.0f}s 内定位未就绪）")
 
     time.sleep(2.0)  # 等匹配结果稳定后再读数
     pose_now = chassis.get_pose() or {}
@@ -387,22 +499,10 @@ def relocalize(chassis, pose, timeout_s=60.0):
     moved = math.hypot(px - bx, py - by) if bx is not None else float("inf")
     if bx is not None:
         print(f"  与重定位前的位姿相差 {moved:.2f} m")
-    # 只有“偏离声明点位”且“相对原姿态也大幅跳变”才认定匹配失败；
-    # 车本就不在声明点位附近时，匹配停在原位属于正常收敛。
-    if dist > RELOC_TOL_M and moved > RELOC_TOL_M:
+    if dist > RELOC_TOL_M or dyaw > RELOC_TOL_RAD:
         raise RuntimeError(
-            f"重定位结果跳变异常：与给定点位相差 {dist:.2f} m，"
-            f"与重定位前位姿相差 {moved:.2f} m"
-            f"（给定 x={x:.2f} y={y:.2f}，实际 x={px:.2f} y={py:.2f}）；"
-            "已拒绝导航。可能这张地图与现场不符，"
-            "请确认后重试，或用 --pose 给出准确位姿")
-    if dist > RELOC_TOL_M:
-        print(f"提示：与给定点位相差 {dist:.2f} m，但与重定位前位姿只差 {moved:.2f} m，"
-              "按当前实际位置继续")
-    if dyaw > RELOC_TOL_RAD:
-        # 朝向差只说明车摆的方向不同，后面 align_to_yaw 会转正
-        print(f"提示：车头朝向与预期相差 {math.degrees(dyaw):.1f}°，"
-              "位置可用，继续（后续会按点位朝向转向）")
+            f"重定位结果与声明初值相差 {dist:.2f} m / {math.degrees(dyaw):.1f}°，"
+            "拒绝导航。请核对实际位置、车头方向及地图，不自动放宽搜索范围")
     return px, py, pyaw
 
 
@@ -428,20 +528,15 @@ def load_map(chassis, name, timeout_s, pose, reloc_poi=""):
                   "可在车旁用 --pose x,y,yaw 指定")
 
     if already_current:
-        # 当前地图不用重载；定位状态交给调用方（导航前会再检查一次），
-        # 这样 --list 只读操作不会被 60s 的等待卡住。
-        print(f"当前地图已经是 {short}，无需重复加载"
-              "（如要按指定位姿重新匹配，加 --reloc）")
+        print(f"当前地图已经是 {short}，保留现有定位，不重复加载地图")
         return target, pose
 
     print(f"加载地图：{target}（当前：{full or '无'}）")
     # start_localization 只接受地图名，不带路径和扩展名，统一传短名。
     chassis.start_localization(slam_type=1, map_name=target)
+    time.sleep(3.0)
 
-    if not wait_localization(chassis, timeout_s, pose):
-        raise RuntimeError(
-            "地图加载后定位未就绪；请把车摆到已知点，用 --reloc-poi 点位名 "
-            "或 --pose x,y,yaw 指定初始位姿")
+    # 调用方统一等待或执行强制重定位，避免同次启动提交两次恢复任务。
     return target, pose
 
 
@@ -559,11 +654,55 @@ def _face_target(chassis, poi_name, poi, turn_w, guard, on_blocked, on_resume):
         bearing = math.atan2(float(poi["y"]) - py, float(poi["x"]) - px)
     except (KeyError, TypeError, ValueError):
         return
-    if abs(normalize_angle(bearing - pyaw)) <= math.pi / 2:
+    if abs(normalize_angle(bearing - pyaw)) <= math.pi / 3:
         return
-    print(f"{poi_name} 在车后方，先原地掉头")
+    print(f"{poi_name} 在侧后方，先原地调头")
     align_to_yaw(chassis, bearing, turn_w, f"{poi_name} 掉头",
                  guard, on_blocked, on_resume)
+
+
+def _blocked_near_goal(guard, status):
+    """终点前放弃且前方确实有近物时返回障碍距离（米），否则返回 None。"""
+    if guard is None or not isinstance(status, dict):
+        return None
+    try:
+        remaining_mm = float(status.get("distance_remaining"))
+    except (TypeError, ValueError):
+        return None
+    if remaining_mm <= 0 or remaining_mm > NEAR_GOAL_MM:
+        return None
+    distance = guard.distance()
+    if distance is None or distance > NEAR_GOAL_OBSTACLE_M:
+        return None
+    return distance
+
+
+def _pose_offset(chassis, poi):
+    """当前位姿到点位的平面距离（米）；读不到返回 None。"""
+    try:
+        pose = chassis.get_pose() or {}
+        return math.hypot(float(pose["x"]) - float(poi["x"]),
+                          float(pose["y"]) - float(poi["y"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _localization_brief(chassis):
+    """把定位状态压成一行，写进瞬态失败日志，方便下次直接定位原因。"""
+    try:
+        rv = chassis.get_localization_status() or {}
+        return f"slam_status={rv.get('slam_status')}"
+    except Exception as exc:  # noqa: BLE001 - 诊断信息读不到不影响导航
+        return f"定位状态读取失败：{exc}"
+
+
+def _localization_lost(chassis):
+    """定位状态不是 0 时返回 True（4=未启动定位，同样需要重新匹配）。"""
+    try:
+        status = (chassis.get_localization_status() or {}).get("slam_status")
+    except Exception:  # noqa: BLE001
+        return False
+    return status not in (0, None)
 
 
 def goto_poi(chassis, poi_name, poi, timeout_s, track_id=None,
@@ -577,12 +716,24 @@ def goto_poi(chassis, poi_name, poi, timeout_s, track_id=None,
     """
     retries = 0
     yields = 0
+    use_coord = False
+    recovered = False
+    offset = _pose_offset(chassis, poi)
+    if offset is not None and offset <= GOAL_ARRIVE_M:
+        # 已经在点位旁边还下发导航，底盘会当成零长度任务直接判 failed。
+        print(f"{poi_name} 已在点位附近（偏差 {offset:.2f} m），不再下发导航")
+        return
     if turn_w is not None:
         _face_target(chassis, poi_name, poi, turn_w, guard, on_blocked, on_resume)
     while True:
-        if track_id is None:
+        if track_id is None and not use_coord:
             print(f"点对点前往 {poi_name}")
             rv = chassis.move_to_poi(poi_name=poi_name)
+        elif track_id is None:
+            x, y = float(poi["x"]), float(poi["y"])
+            yaw = float(poi.get("yaw") or 0.0)
+            print(f"改用坐标前往 {poi_name}（x={x:.2f}, y={y:.2f}）")
+            rv = chassis.move_to(x, y, yaw)
         else:
             print(f"沿轨道 {track_id} 前往 {poi_name}")
             rv = chassis.move_to_locations_poi(
@@ -608,12 +759,49 @@ def goto_poi(chassis, poi_name, poi, timeout_s, track_id=None,
                 on_resume()
             time.sleep(REDISPATCH_SETTLE_S)
         except ActionFailed as exc:
-            retries += 1
-            if retries >= REDISPATCH_MAX_ATTEMPTS or not never_started(exc.status):
-                raise
-            print(f"{poi_name} 被判 failed 且从未起步，"
-                  f"{REDISPATCH_SETTLE_S:.1f}s 后重发（第 {retries + 1} 次）")
-            time.sleep(REDISPATCH_SETTLE_S)
+            # 点位前一两米有人或墙时，底盘会反复微调后自行取消。
+            # 此时按“被挡住”处理，播报让行并等待，不要让整场导览直接中止。
+            blocked_distance = _blocked_near_goal(guard, exc.status)
+            if blocked_distance is not None:
+                raise ActionBlocked(
+                    f"{poi_name} 在终点前被挡住（前方 {blocked_distance:.2f} m）",
+                    blocked_distance) from exc
+            # 底盘有时会把“就在点位上”的目标直接回成 failed，
+            # 位姿确实在点位附近就按到达处理，别让回程整段中止。
+            offset = _pose_offset(chassis, poi)
+            if offset is not None and offset <= GOAL_ARRIVE_M:
+                print(f"{poi_name} 动作被底盘取消，但已在点位附近"
+                      f"（偏差 {offset:.2f} m），按到达处理")
+                return
+            if never_started(exc.status):
+                print(f"{poi_name} 底盘瞬态拒绝（{_localization_brief(chassis)}）")
+                # 点名接口连续被拒时换成坐标接口，绕开 POI 名称校验。
+                if not use_coord and track_id is None:
+                    use_coord = True
+                    print(f"{poi_name} 改用坐标导航重试")
+                    time.sleep(REDISPATCH_SETTLE_S)
+                    continue
+                # 定位异常时 move_to 会瞬间失败（move_by_direction 靠里程计还能转），
+                # 用当前位姿重新匹配一次再重试，只做一次，避免原地反复重定位。
+                if track_id is None and not recovered and _localization_lost(chassis):
+                    recovered = True
+                    try:
+                        pose_now = chassis.get_pose() or {}
+                        relocalize(chassis,
+                                   (float(pose_now["x"]), float(pose_now["y"]),
+                                    float(pose_now["yaw"])))
+                    except Exception as reloc_exc:  # noqa: BLE001 - 失败就走正常重发
+                        print(f"{poi_name} 重定位失败：{reloc_exc}")
+                    else:
+                        print(f"{poi_name} 重定位完成，重新尝试前往")
+                    continue
+                retries += 1
+                if retries < REDISPATCH_MAX_ATTEMPTS:
+                    print(f"{poi_name} 被判 failed 且从未起步，"
+                          f"{REDISPATCH_SETTLE_S:.1f}s 后重发（第 {retries + 1} 次）")
+                    time.sleep(REDISPATCH_SETTLE_S)
+                    continue
+            raise
     pose = chassis.get_pose() or {}
     dx = float(pose["x"]) - float(poi["x"])
     dy = float(pose["y"]) - float(poi["y"])
@@ -742,7 +930,11 @@ def warmup_tts(timeout=3.0):
 
 def _speak_text_checked(text):
     """确认播放结果；空文本表示显式跳过。"""
-    text = (text or "").strip()
+    from learn1_d.speak_test import clean_text
+
+    # 复用的 TTS 节点是直接赋值 text 的，这里也要过一遍清洗，
+    # 避免大模型回答里的表情/Markdown 让平台合成失败。
+    text = clean_text(text)
     if not text:
         return True
     node = _tts_speaker()
