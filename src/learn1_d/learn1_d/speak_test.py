@@ -8,6 +8,7 @@
 """
 
 import argparse
+import re
 import time
 
 import rclpy
@@ -25,12 +26,25 @@ VOICE_DEFAULT = "tiangong_v2"
 # 不传命令行文本时，默认播这句；改这里就能改默认话术。
 DEFAULT_TEXT = "你好，我是导览机器人，现在开始参观"
 
+# 平台 TTS 对表情、乱码和 Markdown 标记比较敏感，合成失败时音箱会播
+# 平台自带的“音频生成失败”提示音。播报前统一清理成纯文本。
+_BAD_CHARS = re.compile(
+    "[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\uFFFD\u0000-\u0008\u000B-\u001F]")
+_MARKDOWN = re.compile(r"[*_#`~>]+")
+
+
+def clean_text(text: str) -> str:
+    """去掉表情、控制字符和 Markdown 标记，降低 TTS 合成失败概率。"""
+    cleaned = _BAD_CHARS.sub("", str(text or ""))
+    cleaned = _MARKDOWN.sub("", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
 
 class Speaker(Node):
     def __init__(self, text: str, audio_id: str, interrupt: bool,
                  service: str = TTS_SERVICE, context=None) -> None:
         super().__init__("speak_test", context=context)
-        self.text = text.strip()
+        self.text = clean_text(text)
         self.audio_id = audio_id
         self.interrupt = interrupt
         self.service = service
@@ -39,6 +53,23 @@ class Speaker(Node):
         self.voice_default = VOICE_DEFAULT
         self._voice_cli = None
         self._voice_retry_at = 0.0
+
+    def _wait_future(self, future, timeout_sec: float) -> None:
+        """用显式 executor 等待服务响应。
+
+        本节点可能跑在独立 rclpy Context 下（导览主流程就是），此时全局
+        executor 为空，rclpy.spin_until_future_complete 会因 with None 报
+        “NoneType does not support the context manager protocol”。
+        """
+        from rclpy.executors import SingleThreadedExecutor
+
+        executor = SingleThreadedExecutor(context=self.context)
+        executor.add_node(self)
+        try:
+            executor.spin_until_future_complete(future, timeout_sec=timeout_sec)
+        finally:
+            executor.remove_node(self)
+            executor.shutdown()
 
     def set_voice(self, voice: str) -> None:
         """切换全局音色；失败只告警，不打断播报。"""
@@ -56,7 +87,7 @@ class Speaker(Node):
         req = InstructionService.Request()
         req.cmd = voice
         future = self._voice_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        self._wait_future(future, 5.0)
         if not future.done():
             self._voice_retry_at = time.monotonic() + 60.0
             self.get_logger().warn(f"切换音色 {voice} 超时，60 秒内不再尝试")
@@ -81,7 +112,7 @@ class Speaker(Node):
         req.extra = ""
 
         future = self.cli.call_async(req)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+        self._wait_future(future, 5.0)
         if not future.done():
             self.get_logger().error(f"TTS {cmd} 调用超时")
             future.cancel()
@@ -116,6 +147,12 @@ class Speaker(Node):
 
         resp = self.call("append", text=self.text, msg_type="text",
                          audio_id=self.audio_id)
+        if resp is None or not resp.success:
+            # 平台音频服务偶发忙/超时，先补发一次再判定失败。
+            self.get_logger().warn("TTS append 失败，0.3 秒后重试一次")
+            time.sleep(0.3)
+            resp = self.call("append", text=self.text, msg_type="text",
+                             audio_id=self.audio_id)
         if resp is None or not resp.success:
             self.get_logger().error("TTS append 失败")
             return False

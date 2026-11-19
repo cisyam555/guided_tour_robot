@@ -26,9 +26,13 @@ DEFAULTS = {
     "max_reply_chars": 80,
     "chitchat": True,
     "no_answer": "这个我暂时答不上来，可以问问现场的老师。",
-    "end_words": ["不用了", "没有了", "谢谢", "继续", "走吧", "下一个", "出发", "讲解完了", "知道了"],
+    "end_words": ["不用了", "没有了", "没有问题", "没了", "不问了", "问完了",
+                  "谢谢", "继续", "走吧", "下一个", "出发", "讲解完了", "知道了"],
+    "ask_prompt": "大家有什么问题可以问我。",
+    "followup_prompt": "还有别的问题吗？",
     "abort_words": ["不听了", "不想听了", "不看了", "别讲了", "结束导览", "结束参观",
                     "带我回去", "回去吧", "回起点", "回原点", "回待命点", "回去待命"],
+    "faq": [],
 }
 
 _PROMPT = """你是展厅导览机器人，正在「{poi}」点位回答游客的问题。
@@ -71,7 +75,11 @@ class PoiQA:
                           if str(w).strip()] or list(DEFAULTS["end_words"])
         self.abort_words = [str(w).strip() for w in cfg.get("abort_words") or []
                             if str(w).strip()] or list(DEFAULTS["abort_words"])
+        self.ask_prompt = str(cfg.get("ask_prompt") or "").strip()
+        self.followup_prompt = str(cfg.get("followup_prompt") or "").strip()
         self.common_knowledge = self._as_knowledge(cfg.get("common_knowledge"))
+        self.faq = [item for item in (cfg.get("faq") or [])
+                    if isinstance(item, dict) and str(item.get("answer") or "").strip()]
         self._waiter = None
 
     @staticmethod
@@ -82,11 +90,16 @@ class PoiQA:
         return str(value or "").strip()
 
     # ---- 语音输入 -------------------------------------------------------
+    def set_waiter(self, waiter):
+        """复用待机阶段的语音输入，避免重复打开麦克风。"""
+        self._waiter = waiter
+
     def _get_waiter(self):
         if self._waiter is None:
             from learn1_d.voice_wait import VoiceWaiter
 
             self._waiter = VoiceWaiter()
+            self._waiter.spin_for(1.5)
         return self._waiter
 
     # ---- 主流程 ---------------------------------------------------------
@@ -112,6 +125,20 @@ class PoiQA:
             self.enabled = False
             return False
 
+        # 讲完先主动邀请提问，再开聆听窗口。
+        spoken = str(script.get("text") or "")
+        if self.ask_prompt:
+            try:
+                speak(self.ask_prompt)
+                spoken = f"{spoken} {self.ask_prompt}"
+            except Exception:  # noqa: BLE001 - 播报失败不影响问答
+                pass
+        # 游客可能在邀请语播放期间就回答了“没有问题”，播完先查一次。
+        early = self._check_pending(waiter, spoken)
+        if early == "abort":
+            return True
+        if early == "end":
+            return False
         waiter.clear()
         waiter.drain(self.settle_seconds)
 
@@ -122,7 +149,6 @@ class PoiQA:
             timeout=self.timeout, system_prompt=system, history_turns=2)
 
         print(f"{poi_name} 问答开始：{self.listen_seconds:.0f} 秒内可提问")
-        spoken = str(script.get("text") or "")
         while True:
             heard = waiter.hear(self.listen_seconds)
             if heard is None:
@@ -138,24 +164,60 @@ class PoiQA:
                 print(f"  忽略疑似回声：{heard}")
                 continue
             print(f"  提问：{heard}")
-            try:
-                reply = client.chat(heard)
-            except Exception as exc:  # noqa: BLE001 - 模型失败不阻断导览
-                print(f"  问答失败：{exc}")
-                speak(self.no_answer)
-                break
-            reply = self._shorten(reply)
-            if not reply:
-                speak(self.no_answer)
-                break
-            print(f"  回答：{reply}")
+            reply = self._local_answer(heard)
+            if reply:
+                print(f"  本地资料回答：{reply}")
+            else:
+                try:
+                    reply = client.chat(heard)
+                except Exception as exc:  # noqa: BLE001 - 模型失败不阻断导览
+                    print(f"  问答失败：{exc}")
+                    speak(self.no_answer)
+                    break
+                reply = self._shorten(reply)
+                if not reply:
+                    speak(self.no_answer)
+                    break
+                print(f"  回答：{reply}")
             speak(reply)
             spoken = f"{spoken} {reply}"
+            # 答完主动追问一句，游客说“没有了”或沉默 10 秒就前往下一点位。
+            if self.followup_prompt:
+                speak(self.followup_prompt)
+                spoken = f"{spoken} {self.followup_prompt}"
+            # 抢在播报里说的“没有问题/不听了”不能丢，播完统一判定。
+            action = self._check_pending(waiter, spoken)
+            if action == "abort":
+                return True
+            if action == "end":
+                break
             # 播报刚结束，先把麦克风里的回声清干净，再听下一问。
             waiter.clear()
             waiter.drain(self.settle_seconds)
 
         return False
+
+    def _check_pending(self, waiter, spoken):
+        """处理播报期间积压的识别结果，只认结束/返程这类控制词。"""
+        for text in waiter.take_pending():
+            if self._is_abort(text):
+                print(f"  播报期间听到结束导览：{text}")
+                return "abort"
+            if self._is_end(text) and not self._is_echo(text, spoken):
+                print(f"  播报期间听到结束提问：{text}")
+                return "end"
+        return None
+
+    def _local_answer(self, text):
+        """命中本地 FAQ 就直接回答，不依赖大模型网络。"""
+        plain = _plain(text)
+        for item in self.faq:
+            answer = str(item.get("answer") or "").strip()
+            for kw in item.get("keywords") or []:
+                kw = str(kw).strip()
+                if kw and (kw in text or _plain(kw) in plain):
+                    return self._shorten(answer)
+        return ""
 
     def _is_abort(self, text):
         """游客说“不听了/结束导览/带我回去”时结束整场导览并返程。"""
