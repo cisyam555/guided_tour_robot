@@ -232,7 +232,7 @@ def wait_for_visitor(args, guard, waiter, voice, words, sway=None):
 
 def run_tour(args, chassis, guard, pois, targets, track_id, poi_scripts,
              on_blocked, on_resume, on_blocked_return, on_resume_return,
-             need_move_to_start):
+             need_move_to_start, qa=None):
     """走一整趟导览。返回 0=走完，1=回程失败；安全类异常继续上抛交给 main。"""
     # 起点较远时先自己走过去，再播欢迎语、摆正车头、开始导览。
     if need_move_to_start:
@@ -252,6 +252,7 @@ def run_tour(args, chassis, guard, pois, targets, track_id, poi_scripts,
     # 单点失败只跳过该点：只有连续多个点都到不了，或安全功能失效才中止。
     skipped = []
     consecutive_fail = 0
+    aborted = False
     for poi_name in targets:
         poi = pois[poi_name]
         try:
@@ -287,6 +288,15 @@ def run_tour(args, chassis, guard, pois, targets, track_id, poi_scripts,
         if not text and args.arrival:
             text = args.arrival.replace("{poi}", poi_name)
         announce(args, text)
+        # 讲解后的游客问答：问完再转回车头继续走下一个点位。
+        if qa is not None and text:
+            if qa.ask(poi_name, script, lambda reply: announce(args, reply)):
+                aborted = True
+                if args.return_poi:
+                    announce(args, "好的，我们结束参观，现在带您回到起点待命。")
+                else:
+                    announce(args, "好的，我们结束参观。")
+                break
         # 讲解完转回车头，回到该点位在地图里的朝向再前往下一个点位。
         if turn_deg:
             if args.align:
@@ -300,10 +310,9 @@ def run_tour(args, chassis, guard, pois, targets, track_id, poi_scripts,
                                                args.turn_w, f"{poi_name} 讲解结束",
                                                guard, on_blocked, on_resume))
 
-    # 在最后一个讲解点播报结束语，然后（可选）返回起点。
-    # 最后一个点位若已在配置里写好结束语，就不再重复播 --farewell。
+    # 中途听到“不听了/结束导览/带我回去”就直接返程，不再播结束语。
     tail_script = poi_scripts.get(targets[-1]) or {}
-    if not tail_script.get("text"):
+    if not aborted and not tail_script.get("text"):
         announce(args, args.farewell)
 
     if args.return_poi:
@@ -357,6 +366,8 @@ def main():
                         help="到达 --pois 最后一个点位后播报的文本；传空字符串则不播")
     parser.add_argument("--no-speak", dest="speak", action="store_false",
                         help="关闭全部语音播报")
+    parser.add_argument("--no-qa", dest="qa", action="store_false", default=None,
+                        help="关闭点位讲解后的大模型问答；默认用配置里的 qa.enabled")
     parser.add_argument("--no-align", dest="align", action="store_false",
                         help="关闭“每到一个点位后按地图 yaw 重定向”")
     parser.add_argument("--no-wait-voice", dest="wait_voice", action="store_false",
@@ -415,6 +426,8 @@ def main():
         if getattr(args, name) is None:
             setattr(args, name, tour["texts"][key])
     poi_scripts = tour["poi_scripts"]
+    if args.qa is None:
+        args.qa = bool((tour.get("qa") or {}).get("enabled", True))
 
     if not (math.isfinite(args.speed) and 0.05 <= args.speed <= 1.5):
         parser.error("--speed 须在 [0.05, 1.5] 米/秒")
@@ -442,6 +455,7 @@ def main():
     reloc_poi = args.reloc_poi or args.start
     chassis = KnewbotChassisNav(host=args.host, rest_port=args.port)
     guard = None
+    qa = None
     try:
         # 列表模式完全只读：不切换地图、不重定位、不播报、不移动。
         if args.list or not targets:
@@ -550,6 +564,17 @@ def main():
         if args.speak:
             warmup_tts()
 
+        # 到点讲解后的游客问答：大模型回答 + TTS 播报；失败不影响导览。
+        if args.qa and args.speak:
+            try:
+                from learn1_d.poi_qa import PoiQA
+
+                qa = PoiQA(tour.get("qa") or {})
+                print("点位问答已开启：每点讲解后开放提问")
+            except Exception as exc:  # noqa: BLE001 - 问答不可用时照常导览
+                print(f"提示：点位问答不可用，跳过：{exc}")
+                qa = None
+
         # 默认待机：不动，人靠近主动问候，听到指令才出发。
         if args.wait_voice:
             voice = voice_config(tour)
@@ -576,6 +601,7 @@ def main():
                 while True:
                     # 上一场导览期间的语音消息不要带进新一轮待机。
                     waiter.clear()
+                    waiter.drain(0.3)
                     heard = wait_for_visitor(args, guard, waiter, voice, words, sway)
                     if heard is None:
                         print("等待语音指令超时，未开始导览")
@@ -590,7 +616,7 @@ def main():
                     result = run_tour(args, chassis, guard, pois, targets, track_id,
                                       poi_scripts, on_blocked, on_resume,
                                       on_blocked_return, on_resume_return,
-                                      need_move_to_start)
+                                      need_move_to_start, qa)
                     if result != 0:
                         return result
                     # 走完不退出：说一句结束语，然后回到待机等下一位游客。
@@ -604,7 +630,7 @@ def main():
             return run_tour(args, chassis, guard, pois, targets, track_id,
                             poi_scripts, on_blocked, on_resume,
                             on_blocked_return, on_resume_return,
-                            need_move_to_start)
+                            need_move_to_start, qa)
 
     except KeyboardInterrupt:
         # Ctrl+C：不播报，直接安静退出（入口是 console_scripts，这里必须自己接）。
@@ -620,6 +646,11 @@ def main():
         announce(args, "遇到问题，我先停在这里，请联系工作人员")
         return 1
     finally:
+        if qa is not None:
+            try:
+                qa.shutdown()
+            except Exception:  # noqa: BLE001 - 关闭失败不影响退出
+                pass
         if guard is not None:
             try:
                 guard.shutdown()

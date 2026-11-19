@@ -53,6 +53,40 @@ class VoiceWaiter:
         """丢掉已经收到但还没判定的文本，避免播报回声被当成指令。"""
         self._heard = ""
 
+    def drain(self, quiet_s=0.6, max_s=3.0):
+        """把播报期间堆积的识别结果丢掉，直到连续 quiet_s 秒没有新消息。"""
+        self._heard = ""
+        started = time.monotonic()
+        quiet_until = started + quiet_s
+        while time.monotonic() < quiet_until and time.monotonic() - started < max_s:
+            try:
+                self._executor.spin_once(timeout_sec=0.1)
+            except ExternalShutdownException:
+                raise KeyboardInterrupt from None
+            if self._heard:
+                print(f"  忽略回声：{self._heard}")
+                self._heard = ""
+                quiet_until = time.monotonic() + quiet_s
+
+    def hear(self, timeout_s=0.0):
+        """听一句普通说话，不筛关键词；超时返回 None（0 表示一直等）。"""
+        deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
+        next_enable = 0.0
+        while True:
+            try:
+                self._executor.spin_once(timeout_sec=0.2)
+            except ExternalShutdownException:
+                raise KeyboardInterrupt from None
+            now = time.monotonic()
+            if now >= next_enable:
+                self._enable_pub.publish(self._enable_msg)
+                next_enable = now + 0.5
+            if self._heard:
+                text, self._heard = self._heard, ""
+                return text
+            if deadline is not None and now >= deadline:
+                return None
+
     def wait(self, words, timeout_s=0.0):
         """阻塞等待；命中 words 中任一关键词返回该句，超时返回 None（0 表示一直等）。"""
         deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
