@@ -38,28 +38,36 @@ class Speaker(Node):
         self.voice_id = VOICE_ID
         self.voice_default = VOICE_DEFAULT
         self._voice_cli = None
+        self._voice_retry_at = 0.0
 
     def set_voice(self, voice: str) -> None:
         """切换全局音色；失败只告警，不打断播报。"""
         if not voice:
             return
+        # 音色服务不可用时跳过一段时间，避免每句话都白等
+        if time.monotonic() < self._voice_retry_at:
+            return
         if self._voice_cli is None:
             self._voice_cli = self.create_client(InstructionService, VOICE_SERVICE)
         if not self._voice_cli.wait_for_service(timeout_sec=2.0):
-            self.get_logger().warn("音色服务未就绪，沿用当前音色")
+            self._voice_retry_at = time.monotonic() + 60.0
+            self.get_logger().warn("音色服务未就绪，60 秒内不再尝试切换")
             return
         req = InstructionService.Request()
         req.cmd = voice
         future = self._voice_cli.call_async(req)
         rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
         if not future.done():
-            self.get_logger().warn(f"切换音色 {voice} 超时")
+            self._voice_retry_at = time.monotonic() + 60.0
+            self.get_logger().warn(f"切换音色 {voice} 超时，60 秒内不再尝试")
             future.cancel()
             return
         try:
             if not future.result().success:
-                self.get_logger().warn(f"切换音色 {voice} 被拒绝")
+                self._voice_retry_at = time.monotonic() + 60.0
+                self.get_logger().warn(f"切换音色 {voice} 被拒绝，60 秒内不再尝试")
         except Exception as exc:  # noqa: BLE001
+            self._voice_retry_at = time.monotonic() + 60.0
             self.get_logger().warn(f"切换音色 {voice} 异常：{exc}")
 
     def call(self, cmd: str, text: str = "", msg_type: str = "",
