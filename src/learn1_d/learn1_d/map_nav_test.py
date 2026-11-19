@@ -69,14 +69,12 @@
        （默认 0.8 m，连续 3 帧确认）就先主动问候 voice.welcome_text，然后等语音指令。
        语音来自底盘自带识别（/audio_asr/keyword 唤醒词、/audio_asr/iat 识别整句），
        命中 voice.wake_words 或 --wake-words 才开始导览；--listen-timeout 控制每次
-       问候后等多久（默认 30 s），超时没听到指令就回到待机继续摇晃，下一位来再问候。
+       问候后等多久（默认 30 s），超时没听到指令就回到待机继续等，下一位来再问候。
        --wait-timeout 是整体上限（0=一直等）。语音栈不可用会拒绝出发（避免自己乱走），
        调试可加 --no-wait-voice 跳过整个待机环节。
        走完一趟导览会播报 voice.done_text，然后回到待机等下一位游客，不退出。
-       待机时上半身会持续左右各摇 --sway-deg（默认 10°）表示在待机；
-       头部深度相机跟着上身转，所以每摇一个来回都回正、稳定后才判断有人靠近，
-       有人进入 greet_distance 就先回正再问候，等指令时不再摇晃。
-       --sway-deg 0 可关闭。
+       待机时默认不晃动；需要时可用 --sway-deg 指定左右摇摆角度（0~30 度）。
+       有人进入 greet_distance 就主动问候，等指令时不再摇晃。
 
 代码位置：底盘/地图相关的工具函数在 nav_core.py，路线与话术配置在 tour.json
 （由 tour_config.py 读取校验），本文件只负责命令行参数和导览流程编排。
@@ -384,8 +382,8 @@ def main():
                         help="有人进入该距离（米）就主动问候；0 表示用配置里的值")
     parser.add_argument("--listen-timeout", type=float, default=0.0,
                         help="问候后等待语音指令的秒数；0 表示用配置里的值")
-    parser.add_argument("--sway-deg", type=float, default=10.0,
-                        help="待机时上半身左右摇摆的角度（度）；0 表示不摇晃")
+    parser.add_argument("--sway-deg", type=float, default=0.0,
+                        help="待机时上半身左右摇摆的角度（度）；0 表示不摇晃（默认）")
     parser.add_argument("--pose", default="", help="重定位初始位姿 x,y,yaw")
     parser.add_argument("--reloc-poi", default="",
                         help="重定位用哪个点位的坐标（车停在该点位附近时填它）")
